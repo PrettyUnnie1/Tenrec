@@ -23,7 +23,7 @@ article_items = json.load(open("../Model/Deep FM/article/article_items.json"))
 video_item_map = json.load(open("../Model/Deep FM/video/video_item_map.json"))
 article_item_map = json.load(open("../Model/Deep FM/article/article_item_map.json"))
 gender_map = json.load(open("../Model/Deep FM/gender_map.json"))
-numeric_defaults = json.load(open("../Model/Deep FM/numeric_defaults.json"))
+numeric_defaults = json.load(open("numeric_defaults.json"))
 
 # Load models
 video_model = load_deepfm_model("../Model/Deep FM/video/deepfm_model.pth",

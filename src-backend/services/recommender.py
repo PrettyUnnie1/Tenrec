@@ -15,17 +15,20 @@ def batch_predict(model, items, item_map, gender_map, numeric_defaults,
 
         for item_id in batch_items:
             if domain == "video":
-                video_cat = item_map.get(str(item_id), 0)
-                cat_batch.append([0, item_id, video_cat, gender_encoded, age])
+                video_cat = int(item_map.get(str(item_id), 0))        # ép category sang int
+                cat_batch.append([int(0), int(item_id), video_cat, int(gender_encoded), int(age)])
                 num_batch.append([numeric_defaults['video']['watching_times']])
             else:
                 article_cat = item_map.get(str(item_id),
-                                           {"category_first": 0, "category_second": 0})
-                cat_batch.append([0, item_id,
-                                  article_cat["category_second"],
-                                  article_cat["category_first"],
-                                  gender_encoded, age])
-                # 9 numeric features default
+                           {"category_first": 0, "category_second": 0})
+
+                # xử lý "\N"
+                cat_first = 0 if article_cat["category_first"] in ["\\N", None] else int(article_cat["category_first"])
+                cat_second = 0 if article_cat["category_second"] in ["\\N", None] else int(article_cat["category_second"])
+
+                cat_batch.append([int(0), int(item_id),
+                                cat_second, cat_first,
+                                int(gender_encoded), int(age)])
                 num_batch.append([numeric_defaults['article'][f] for f in numeric_defaults['article']])
 
         cat_tensor = torch.tensor(cat_batch, dtype=torch.long)
