@@ -38,12 +38,13 @@ def recommend():
     age = data.get("age", 25)
 
     top_videos = batch_predict(video_model, video_items, video_item_map,
-                               gender_map, numeric_defaults, scaler_video,
-                               gender, age, "video")[:5]
+                           gender_map, numeric_defaults, scaler_video,
+                           feature_index_video, gender, age, "video")
 
     top_articles = batch_predict(article_model, article_items, article_item_map,
-                                 gender_map, numeric_defaults, scaler_article,
-                                 gender, age, "article")[:5]
+                             gender_map, numeric_defaults, scaler_article,
+                             feature_index_article, gender, age, "article")
+
 
     return jsonify({
         "videos": [item for item, score in top_videos],
