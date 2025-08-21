@@ -6,7 +6,7 @@ URL = "http://127.0.0.1:5001/recommend/video"
 # ✅ Data input cho API
 payload = {
     "gender": 1,
-    "age": 3
+    "age": 4
 }
 
 try:
