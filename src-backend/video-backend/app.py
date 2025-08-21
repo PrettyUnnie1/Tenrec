@@ -8,6 +8,80 @@ import sys
 import os
 import pandas as pd
 import time
+from itertools import combinations
+
+# Giữ đúng thứ tự categorical bạn đang dùng (phải khớp với cat_dims & cat_tensor)
+CAT_FIELDS = ['user_id', 'item_id', 'video_category', 'gender', 'age']
+
+def _resolve_embedding_list(model, expect_len):
+    """
+    Tìm ModuleList các nn.Embedding dùng cho FM (second-order).
+    - Ưu tiên list có embedding_dim > 1 (vì first-order thường dim=1)
+    - Dài đúng expect_len (= len(CAT_FIELDS))
+    """
+    candidates = []
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.ModuleList) and len(module) == expect_len:
+            if all(isinstance(m, torch.nn.Embedding) for m in module):
+                # tính dim trung bình để chọn list có dim lớn nhất (khả năng là FM)
+                dims = [m.embedding_dim for m in module]
+                avg_dim = sum(dims) / len(dims)
+                candidates.append((avg_dim, name, module))
+
+    if not candidates:
+        raise AttributeError(
+            "Không tìm thấy ModuleList[Embedding] dài bằng len(CAT_FIELDS). "
+            "Hãy kiểm tra kiến trúc DeepFM và điều chỉnh _resolve_embedding_list()."
+        )
+
+    # chọn module có avg_dim lớn nhất (thường là FM second-order)
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][2]  # return module
+
+def get_field_embedding(model, field_idx, index_id, device='cpu'):
+    """
+    Lấy embedding vector (1D tensor) cho field thứ field_idx với id index_id.
+    Dò ModuleList embedding phù hợp (FM second-order).
+    """
+    emb_list = _resolve_embedding_list(model, expect_len=len(CAT_FIELDS))
+    emb_layer = emb_list[field_idx]
+    vec = emb_layer(torch.tensor([index_id], device=device)).squeeze(0)
+    return vec  # shape [emb_dim]
+
+@torch.no_grad()
+def pairwise_interactions(named_embs, x_vals=None, top_k=5, only_cross=False):
+    """
+    named_embs: list[(name, tensor)], ví dụ:
+        [('USER.gender=1', vec), ('USER.age=4', vec), ('ITEM.item_id=774', vec)]
+    x_vals: dict name -> scalar (mặc định 1.0)
+    only_cross: True -> chỉ giữ cặp USER.* x ITEM.* (dễ hiểu hơn)
+    return: list[{pair, dot, contribution}] sắp theo |contribution| giảm dần
+    """
+    if x_vals is None:
+        x_vals = {name: 1.0 for name, _ in named_embs}
+
+    out = []
+    for (n1, e1), (n2, e2) in combinations(named_embs, 2):
+        if only_cross:
+            is_user1 = n1.startswith('USER.')
+            is_user2 = n2.startswith('USER.')
+            is_item1 = n1.startswith('ITEM.')
+            is_item2 = n2.startswith('ITEM.')
+            # giữ đúng 1 USER và 1 ITEM trong cặp
+            if not ((is_user1 and is_item2) or (is_item1 and is_user2)):
+                continue
+
+        dot = torch.dot(e1, e2).item()
+        contrib = dot * float(x_vals.get(n1, 1.0)) * float(x_vals.get(n2, 1.0))
+        out.append({
+            'pair': f'{n1} x {n2}',
+            'dot': round(dot, 6),
+            'contribution': round(contrib, 6),
+        })
+
+    out.sort(key=lambda d: abs(d['contribution']), reverse=True)
+    return out[:top_k]
+
 
 # 🔹 Import DeepFM class từ file deepfm.py
 sys.path.append("../models")
@@ -17,6 +91,10 @@ from deepfm import DeepFM
 # 1️⃣ Khởi tạo Flask
 # ============================================================
 app = Flask(__name__)
+# Số cặp tương tác muốn show
+TOPK_INTERACTIONS = 5
+# Chỉ show cặp USER x ITEM cho dễ hiểu
+ONLY_USER_ITEM_PAIRS = True
 
 # ============================================================
 # 2️⃣ Load model và các file cần thiết
@@ -74,22 +152,23 @@ def recommend_video():
     data = request.get_json()
     gender = data.get("gender")
     age = data.get("age")
+    topN = int(data.get("topN", 5))
+    explain_flag = str(data.get("explain", "0")).lower() in ("1", "true", "yes")
 
     if gender is None or age is None:
         return jsonify({"error": "Missing gender or age"}), 400
 
-    # ✅ In thông tin input
     print(f"[DEBUG] Input received -> gender: {gender}, age: {age}")
-    
+
     # Chuẩn bị input fixed cho gender & age
     gender_idx, age_idx = prepare_input(gender, age)
 
-    # ✅ Đếm số item_id trong feature_index
     total_items = len(feature_index['item_id'])
     print(f"[DEBUG] Total item_id to score: {total_items}")
-    
-    # ✅ Vì model cần score tất cả item_id để lấy top-5
+
     item_scores = []
+
+    # ===== 1) VÒNG LẶP CHẤM ĐIỂM (có limit 50 như bạn đang debug) =====
     for count, (item_val, item_idx) in enumerate(feature_index['item_id'].items(), start=1):
         if count > 50:
             print("[DEBUG] Stopping loop at 50 items for debug.")
@@ -99,17 +178,16 @@ def recommend_video():
             elapsed = time.time() - start_time
             print(f"[DEBUG] Processed {count} items... Elapsed: {elapsed:.2f}s")
 
-        # Giả sử category không được input từ người dùng,
-        # ta tạm set = 0 hoặc bạn có thể random/định nghĩa strategy riêng.
-        video_category_idx = 0
-
-        # User_id không có => gán 'unknown_user' (nếu có)
+        # user_id không có -> 'unknown_user' nếu có, else 0
         user_idx = feature_index['user_id'].get("unknown_user", 0)
 
-        # Tạo tensor categorical (1 hàng)
+        # Ở demo này bạn đang không có category cho từng item -> tạm 0
+        video_category_idx = 0
+
+        # Tạo tensor categorical (1 hàng) theo đúng thứ tự CAT_FIELDS
         cat_tensor = torch.tensor([[user_idx, item_idx, video_category_idx, gender_idx, age_idx]], dtype=torch.long)
 
-        # Numeric features: watching_times (chưa có từ input, tạm để = 1 hoặc scaler.mean_)
+        # Numeric features: watching_times tạm = 1.0 -> scale
         watch_times = pd.DataFrame([1.0], columns=["watching_times"])
         watch_times_scaled = scaler.transform(watch_times)
         num_tensor = torch.tensor(watch_times_scaled, dtype=torch.float32)
@@ -118,18 +196,82 @@ def recommend_video():
         with torch.no_grad():
             score = model(cat_tensor, num_tensor).item()
 
-        item_scores.append((int(item_val), score))
+        item_scores.append((int(item_val), int(item_idx), score))  # (item_id gốc, item_idx cho embed, score)
 
-    # Lấy top-5 item cao nhất
-    top_items = sorted(item_scores, key=lambda x: x[1], reverse=True)[:5]
+    # ===== 2) Lấy Top-N theo score =====
+    item_scores.sort(key=lambda x: x[2], reverse=True)
+    top_items_raw = item_scores[:topN]
+
+    # ===== 3) Nếu explain, tính top interactions cho từng item Top-N =====
+    recommendations = []
+    top_interactions_global = None
+
+    if explain_flag:
+        device = next(model.parameters()).device if any(p.requires_grad for p in model.parameters()) else 'cpu'
+
+        # Embedding cho user fields (cố định theo request)
+        # mapping field_name -> (field_idx, value_idx)
+        # CAT_FIELDS = ['user_id', 'item_id', 'video_category', 'gender', 'age']
+        user_pairs = [
+            ('user_id', feature_index['user_id'].get("unknown_user", 0)),
+            ('gender', gender_idx),
+            ('age', age_idx),
+        ]
+
+        named_user_embs = []
+        for fname, vidx in user_pairs:
+            fidx = CAT_FIELDS.index(fname)
+            vec = get_field_embedding(model, fidx, vidx, device=device)
+            named_user_embs.append((f'USER.{fname}={vidx}', vec))
+
+        # (tuỳ chọn) top interactions chỉ giữa các field user (global)
+        top_interactions_global = pairwise_interactions(named_user_embs, top_k=TOPK_INTERACTIONS, only_cross=False)
+
+        # Với từng item top-N: thêm ITEM.* rồi tính cross USER x ITEM
+        for (item_id_val, item_idx_val, score) in top_items_raw:
+            named_embs = list(named_user_embs)  # copy
+
+            # ITEM.item_id
+            f_item = CAT_FIELDS.index('item_id')
+            vec_item = get_field_embedding(model, f_item, item_idx_val, device=device)
+            named_embs.append((f'ITEM.item_id={item_idx_val}', vec_item))
+
+            # ITEM.video_category (ở đây đang cố định = 0)
+            f_cat = CAT_FIELDS.index('video_category')
+            vec_cat = get_field_embedding(model, f_cat, 0, device=device)
+            named_embs.append((f'ITEM.video_category=0', vec_cat))
+
+            # x_vals: one-hot -> 1.0
+            top_pairs = pairwise_interactions(
+                named_embs,
+                x_vals=None,
+                top_k=TOPK_INTERACTIONS,
+                only_cross=ONLY_USER_ITEM_PAIRS
+            )
+
+            recommendations.append({
+                "item_id": item_id_val,
+                "score": round(score, 4),
+                "top_interactions": top_pairs
+            })
+
+    else:
+        # Không explain -> trả về gọn
+        for (item_id_val, item_idx_val, score) in top_items_raw:
+            recommendations.append({
+                "item_id": item_id_val,
+                "score": round(score, 4)
+            })
 
     total_time = time.time() - start_time
     print(f"[DEBUG] Finished scoring. Total time: {total_time:.2f}s")
-    
+
     return jsonify({
         "gender": gender,
         "age": age,
-        "recommendations": [{"item_id": i, "score": round(s, 4)} for i, s in top_items]
+        "topN": topN,
+        "recommendations": recommendations,
+        "top_interactions_global": top_interactions_global if explain_flag else None
     })
 
 # ============================================================
