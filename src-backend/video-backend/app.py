@@ -110,6 +110,8 @@ with open(FEATURE_INDEX_PATH, "rb") as f:
 # Load scaler
 with open(SCALER_PATH, "rb") as f:
     scaler: StandardScaler = pickle.load(f)
+# feature_index: {col: {raw_val -> index}}
+rev_feature_index = {col: {v: k for k, v in feature_index[col].items()} for col in feature_index}
 
 # Xác định số dimension cho từng categorical feature
 cat_dims = [len(feature_index[col]) for col in ['user_id', 'item_id', 'video_category', 'gender', 'age']]
@@ -143,10 +145,30 @@ def prepare_input(gender, age):
 
     return gender_idx, age_idx
 
+def format_interaction_label(pair_str, rev_index_dict):
+    """
+    Ví dụ: "USER.gender=0 x ITEM.item_id=4" -> "gender × item_id"
+    Cũng trả về bản có label gốc: "gender=1 × item_id=5"
+    """
+    def decode_part(part):
+        if '=' not in part:
+            return part
+        field_full, idx = part.split('=')
+        idx = int(idx)
+        prefix, field = field_full.split('.')
+        raw_val = rev_index_dict.get(field, {}).get(idx, str(idx))
+        return f"{field}={raw_val}"
+
+    left, right = pair_str.split(' x ')
+    return decode_part(left), decode_part(right)
+
+
 # ============================================================
 # 5️⃣ API endpoint
 # ============================================================
 @app.route("/recommend/video", methods=["POST"])
+# Format explanation text cho UI dễ show
+
 def recommend_video():
     start_time = time.time()
     data = request.get_json()
@@ -248,6 +270,13 @@ def recommend_video():
                 top_k=TOPK_INTERACTIONS,
                 only_cross=ONLY_USER_ITEM_PAIRS
             )
+            
+            for p in top_pairs:
+                sign = "+" if p['contribution'] >= 0 else "−"
+                val = abs(p['contribution'])
+                left, right = format_interaction_label(p['pair'], rev_feature_index)
+                p['description'] = f"{sign}{val:.2f}: {left.split('=')[0]} × {right.split('=')[0]}"
+                p['label_pair'] = f"{left} × {right}"
 
             recommendations.append({
                 "item_id": item_id_val,
@@ -271,8 +300,10 @@ def recommend_video():
         "age": age,
         "topN": topN,
         "recommendations": recommendations,
-        "top_interactions_global": top_interactions_global if explain_flag else None
+        "top_interactions_global": top_interactions_global if explain_flag else None,
     })
+
+    
 
 # ============================================================
 # 6️⃣ Chạy server
