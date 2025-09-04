@@ -2,8 +2,9 @@ from flask import Flask, request, jsonify
 import joblib
 import numpy as np
 import pandas as pd
+import time
 
-# === Đường dẫn tới model và encoder ===
+# === Đường dẫn ===
 MODEL_PATH = "../../Model/Logistic Regression/logistic_model.pkl"
 ENCODER_PATH = "../../Model/Logistic Regression/onehot_encoder.pkl"
 
@@ -20,17 +21,17 @@ print("🟢 Sample item_id:", ALL_ITEM_IDS[:5])
 
 app = Flask(__name__)
 
-# === Hàm tạo vector đặc trưng từ input ===
-def build_feature_vector(gender, age, item_id):
-    df_input = pd.DataFrame([{
-        'item_id': str(item_id),
-        'gender': str(gender),
-        'age': str(age)
-    }])
-    X_cat = encoder.transform(df_input)
+# === Hàm build batch input ===
+def build_batch_features(gender, age, item_ids):
+    df = pd.DataFrame({
+        'item_id': item_ids,
+        'gender': [str(gender)] * len(item_ids),
+        'age': [str(age)] * len(item_ids)
+    })
+    X_cat = encoder.transform(df)
     return X_cat
 
-# === API endpoint chính ===
+# === API chính ===
 @app.route("/recommend/lr", methods=["POST"])
 def recommend_lr():
     data = request.get_json()
@@ -41,15 +42,22 @@ def recommend_lr():
     if gender is None or age is None:
         return jsonify({"error": "Missing gender or age"}), 400
 
-    results = []
+    start_time = time.time()
 
-    for item_id in ALL_ITEM_IDS:
-        x_input = build_feature_vector(gender, age, item_id)
-        score = model.predict_proba(x_input)[0][1]
-        results.append((item_id, float(score)))
+    # Tạo batch input một lần
+    item_ids = list(ALL_ITEM_IDS)
+    X_input = build_batch_features(gender, age, item_ids)
 
+    # Dự đoán tất cả item trong 1 lần
+    scores = model.predict_proba(X_input)[:, 1]
+
+    # Ghép lại thành kết quả
+    results = list(zip(item_ids, scores))
     results.sort(key=lambda x: x[1], reverse=True)
     top_items = results[:topN]
+
+    total_time = time.time() - start_time
+    print(f"[INFO] Dự đoán {len(item_ids)} item mất {total_time:.2f} giây")
 
     return jsonify({
         "gender": gender,
